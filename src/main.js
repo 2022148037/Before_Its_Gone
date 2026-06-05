@@ -1,0 +1,126 @@
+import { createScene } from './scene.js';
+import { Player } from './player.js';
+import { AnimalManager } from './animalAI.js';
+import { UI } from './ui.js';
+import { CameraMode } from './cameraMode.js';
+import { buildWorld, getTerrainHeight } from './world.js';
+import { Doomsday } from './doomsday.js';
+import { Flashlight } from './flashlight.js';
+import { createSettingsPanel } from './settings.js';
+import { IntroCinematic } from './intro3d.js';
+import { MeteorStrikes } from './meteors.js';
+import { Minimap } from './minimap.js';
+import { showEnding } from './ending.js';
+import { initBGM } from './audio.js';
+
+const canvas = document.getElementById('app');
+const { scene, camera, renderer, sun, hemi } = createScene(canvas);
+
+// 배경 음악 — 첫 사용자 입력에서 루프 재생 (브라우저 자동재생 정책)
+initBGM('assets/audio/bgm.mp3', { volume: 0.35 });
+
+// 숲 월드 구성 (지형 텍스처 + 나무/바위/풀)
+buildWorld(scene, { area: 95 }).then(() => console.log('[world] built'));
+
+const player = new Player(scene);
+
+// 동물 스폰 (지형 높이 전달)
+const animalMgr = new AnimalManager(scene);
+let spawned = false;   // 스폰 완료 후에만 '완수 엔딩'을 판정
+animalMgr.spawn(
+  {
+    Cow: 2, Horse: 2, Zebra: 2, Pig: 2, Sheep: 2, Rat: 2, Frog: 2, Spider: 2, Trex: 1, Triceratops: 1,
+    // 추가 동물
+    Deer: 3, Stag: 2, Fox: 3, Wolf: 2, Alpaca: 2, Bull: 2, Donkey: 2, Husky: 2, ShibaInu: 2,
+    // 물고기 (연못)
+    Clownfish: 3, Koi: 2, BlueTang: 3, Puffer: 2, Goldfish: 3,
+  },
+  { bounds: 90, getHeight: getTerrainHeight }
+).then((agents) => { spawned = true; console.log('[spawn] total animals:', agents.length); });
+
+// UI + 카메라(촬영) 모드
+const ui = new UI();
+animalMgr.ui = ui;   // 미촬영 동물 발광 토글용
+ui.animalMgr = animalMgr;   // 도감 생존 수 표시용
+const cameraMode = new CameraMode(camera, renderer, animalMgr, ui, player);
+
+// 종말 진행(붉어지는 하늘 + 카운트다운) + 손전등
+const doomsday = new Doomsday(scene, sun, hemi, { duration: 300 }); // 플레이타임 5분 (서사상 충돌까지 5시간)
+doomsday.onStage = (m) => ui.showToast(m);   // 시간대별 서사 한 줄 → 토스트
+const flashlight = new Flashlight(scene, camera);
+
+// Controls 패널 (감도, 카메라 거리, 종말 시간 등)
+createSettingsPanel(player, doomsday, cameraMode);
+
+// 게임 중 운석 낙하(흔들림·크레이터·생명체 사망) — 종말 카운트다운 중에만 활성
+const meteors = new MeteorStrikes(scene, camera, animalMgr, doomsday, getTerrainHeight, ui, player);
+
+// 미니맵 (플레이어·미촬영 종·운석 경고·경계)
+const minimap = new Minimap(player, animalMgr, meteors, ui, { radius: player.bound });
+
+// 3D 시네마틱 인트로 (게임 씬 위에서 카메라 연출 + 운석). 종료 시 게임플레이 시작.
+const intro = new IntroCinematic(scene, camera, doomsday);
+let introActive = true;
+intro.onDone = () => { introActive = false; };
+
+// 엔딩 — D-0 충돌(impact) 또는 운석 직격으로 인한 즉사(caught)
+let ended = false;
+function endGame(cause) {
+  if (ended) return;
+  ended = true;
+  doomsday.running = false;        // 카운트다운/운석 스폰 정지
+  const delay = cause === 'caught' ? 900 : 1100;
+  setTimeout(() => {
+    showEnding(
+      { capturedMap: ui.captured, total: ui.total, lost: meteors.lostCount, cause },
+      () => location.reload()
+    );
+  }, delay);
+}
+// D-0 도달: 최후의 대형 운석 + 화이트아웃
+doomsday.onImpact = () => { meteors.finalStrike(player.mesh.position); endGame('impact'); };
+// 플레이어가 운석에 휩쓸림: 즉사 → 조기 종료
+meteors.onPlayerKilled = () => { player.kill(); endGame('caught'); };
+
+// 디버그 핸들 (개발용)
+window.__game = { scene, camera, renderer, player, animalMgr, ui, cameraMode, doomsday, flashlight, intro, meteors };
+
+let last = performance.now();
+function animate(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  if (introActive) {
+    // 인트로 중: 카메라는 시네마틱이 제어, 동물은 살아 움직이게 둠
+    intro.update(dt);
+    animalMgr.update(dt, player.mesh.position, getTerrainHeight);
+    doomsday.update(dt);
+  } else if (!ended) {
+    // 포인터 잠금이 풀리거나(Esc) 도감을 열면 일시정지
+    const dexOpen = ui.isDexOpen();
+    if (document.pointerLockElement && !dexOpen) {
+      ui.setPaused(false);
+      player.update(dt, camera, getTerrainHeight);
+      animalMgr.update(dt, player.mesh.position, getTerrainHeight);
+      cameraMode.update(dt);
+      doomsday.update(dt);
+      meteors.update(dt);
+      meteors.applyShake(camera);   // player.update 이후 카메라에 흔들림 적용
+      // 촬영(카메라) 모드 중에는 미니맵 숨김 (몰입)
+      if (cameraMode.active) minimap.setHidden(true);
+      else { minimap.setHidden(false); minimap.update(); }
+      // 살아있는 동물이 모두 이미 도감에 등록된 종이면(더 찍을 게 없으면) 완수 엔딩
+      if (spawned && animalMgr.agents.length > 0 && animalMgr.agents.every(a => ui.isCaptured(a.key))) endGame('cleared');
+    } else {
+      // 도감 화면은 그 자체가 전체 오버레이라 일시정지 안내는 띄우지 않음
+      ui.setPaused(!dexOpen);
+    }
+  } else {
+    // 종료 연출: 운석/흔들림 잔향만 계속 감쇠
+    meteors.update(dt);
+    meteors.applyShake(camera);
+  }
+  flashlight.update(doomsday.dayFactor);
+  renderer.render(scene, camera);
+  requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);

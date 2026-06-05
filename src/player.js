@@ -1,0 +1,281 @@
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
+import { resolveCollision } from './world.js';
+
+// 플레이어: 3인칭 이동 + 마우스 시점(포인터 잠금) + 점프(중력).
+// 시각 모델은 Mixamo 캐릭터(glb, idle/walk/run 애니 내장 + webp 텍스처로 경량화).
+// this.mesh(Group)가 이동/회전/물리를 담당하고, 로드된 모델을 그 자식으로 붙여
+// 다른 모듈(카메라/동물 AI)은 기존 인터페이스 그대로 사용.
+// 주인공 모델 경로. .fbx / .glb / .gltf 모두 지원 (확장자로 로더 자동 선택).
+// start.bat이 선택한 Quaternius 캐릭터를 이 파일명으로 public/assets/player/ 에 복사함.
+const PLAYER_PATH = 'assets/player/MainCharacter.fbx';
+const TARGET_HEIGHT = 1.9;   // 모델을 정규화할 키(m)
+const FACE_FIX = 0;          // 모델 정면이 진행방향과 반대면 Math.PI 로 변경
+
+const gltfLoader = new GLTFLoader();
+const fbxLoader = new FBXLoader();
+
+// 확장자에 따라 FBX/glTF 로더 선택 → { scene, animations }
+function loadPlayerModel(path) {
+  return new Promise((resolve, reject) => {
+    if (/\.fbx$/i.test(path)) {
+      fbxLoader.load(path, (o) => resolve({ scene: o, animations: o.animations || [] }), undefined, reject);
+    } else {
+      gltfLoader.load(path, (g) => resolve({ scene: g.scene, animations: g.animations || [] }), undefined, reject);
+    }
+  });
+}
+
+export class Player {
+  constructor(scene) {
+    // 이동/물리/회전을 담당하는 컨테이너 (모델 로드 전에도 동작)
+    this.mesh = new THREE.Group();
+    this.mesh.position.set(0, 1, 0);
+    scene.add(this.mesh);
+
+    this.velocityY = 0;
+    this.onGround = true;
+    this.yaw = 0;           // 좌우 회전(마우스 X)
+    this.cameraPitch = 0.3; // 카메라 상하 각(마우스 Y)
+    this.speed = 6;
+    this.runSpeed = 11;
+    this.sensitivityX = 1.0;
+    this.sensitivityY = 1.0;
+    this.cameraDistance = 8;
+    this.turnSpeed = 10;    // 캐릭터 회전 보간 속도(클수록 빠르게 돌아봄)
+    this.groundOffset = 0;  // 발이 모델 원점(y=0)에 정렬되므로 0
+    this.firstPerson = false; // V키로 1·3인칭 전환
+    this.eyeHeight = 1.6;     // 1인칭 눈높이(m)
+    this.bound = 92;          // 맵 활동 반경 — 이 밖으로는 못 나감
+    this.dead = false;        // 운석에 휩쓸리면 true → 조작 정지
+    this.radius = 0.5;        // 충돌 반경(원기둥)
+
+    // 애니메이션
+    this.mixer = null;
+    this.actions = {};         // idle/walk/run/jump ...
+    this.current = null;
+
+    this.keys = {};
+    this._initInput();
+    this._loadModel();
+  }
+
+  _loadModel() {
+    loadPlayerModel(PLAYER_PATH).then(({ scene: model, animations }) => {
+      // 키 정규화 (바운딩박스로 목표 키에 맞춤 — FBX의 cm 스케일도 자동 보정)
+      const box = new THREE.Box3().setFromObject(model);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      model.scale.setScalar(TARGET_HEIGHT / (size.y || 1));
+      model.rotation.y = FACE_FIX;
+
+      model.traverse((c) => {
+        if (c.isMesh) {
+          c.castShadow = true;
+          c.frustumCulled = false;
+        }
+      });
+
+      this.mesh.add(model);
+      this.model = model;
+      this.mixer = new THREE.AnimationMixer(model);
+
+      // 내장 클립(idle/walk/run/jump) 등록 + 전진(루트) 모션 제거
+      for (const clip of (animations || [])) {
+        const kind = classifyClip(clip.name);
+        if (!kind) continue;
+        stripRootMotion(clip);
+        this.actions[kind] = this.mixer.clipAction(clip);
+      }
+
+      this._setAction('idle', 0);
+      this.mixer.update(0);   // idle 자세로 1회 포즈 후 발 정렬
+      this._alignFeet();
+    }).catch((err) => {
+      console.error('[player] 모델 로드 실패:', err);
+    });
+  }
+
+  // 스켈레톤 본 기준으로 가장 낮은 발 본을 mesh 로컬 y=0(=지면)에 맞춤.
+  // 스킨드 glb는 원점이 엉덩이라 setFromObject로는 발 위치를 못 잡음.
+  _alignFeet() {
+    if (!this.model) return;
+    this.mesh.updateWorldMatrix(true, true);
+    const wp = new THREE.Vector3();
+    let minY = Infinity;
+    this.model.traverse((c) => {
+      if (c.isBone) {
+        c.getWorldPosition(wp);
+        this.mesh.worldToLocal(wp);
+        if (wp.y < minY) minY = wp.y;
+      }
+    });
+    if (Number.isFinite(minY)) this.model.position.y -= minY;
+  }
+
+  _setAction(kind, fade = 0.2) {
+    const next = this.actions[kind] || this.actions.idle;
+    if (!next || next === this.current) return;
+    next.reset().fadeIn(fade).play();
+    if (this.current) this.current.fadeOut(fade);
+    this.current = next;
+  }
+
+  _initInput() {
+    window.addEventListener('keydown', (e) => {
+      this.keys[e.code] = true;
+    });
+    window.addEventListener('keyup', (e) => (this.keys[e.code] = false));
+
+    const canvas = document.getElementById('app');
+    canvas.addEventListener('click', () => canvas.requestPointerLock());
+    document.addEventListener('mousemove', (e) => {
+      if (document.pointerLockElement !== canvas) return;
+      this.yaw -= e.movementX * 0.0025 * this.sensitivityX;
+      this.cameraPitch = THREE.MathUtils.clamp(
+        this.cameraPitch + e.movementY * 0.0025 * this.sensitivityY, -0.6, 1.3
+      );
+    });
+  }
+
+  update(dt, camera, getHeight = () => 0) {
+    if (this.dead) { if (this.mixer) this.mixer.update(dt); this._updateCamera(camera); return; }
+    const k = this.keys;
+    const running = k['ShiftLeft'] || k['ShiftRight'];
+    const spd = running ? this.runSpeed : this.speed;
+
+    const forward = new THREE.Vector3(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
+    const right = new THREE.Vector3(Math.cos(this.yaw), 0, -Math.sin(this.yaw));
+    const move = new THREE.Vector3();
+    if (k['KeyW']) move.add(forward);
+    if (k['KeyS']) move.sub(forward);
+    if (k['KeyD']) move.add(right);
+    if (k['KeyA']) move.sub(right);
+
+    const moving = move.lengthSq() > 0;
+    if (moving) {
+      move.normalize().multiplyScalar(spd * dt);
+      this.mesh.position.add(move);
+      this.targetFacing = Math.atan2(move.x, move.z);
+    }
+
+    // 목표 방향으로 부드럽게 회전(최단 경로) — 즉시 꺾임/순간이동 방지
+    if (this.targetFacing !== undefined) {
+      let diff = this.targetFacing - this.mesh.rotation.y;
+      diff = Math.atan2(Math.sin(diff), Math.cos(diff)); // [-π, π]로 래핑
+      this.mesh.rotation.y += diff * Math.min(1, this.turnSpeed * dt);
+    }
+
+    // 점프 + 중력
+    if (k['Space'] && this.onGround) {
+      this.velocityY = 8;
+      this.onGround = false;
+    }
+    this.velocityY -= 22 * dt;
+    this.mesh.position.y += this.velocityY * dt;
+
+    const groundY = getHeight(this.mesh.position.x, this.mesh.position.z) + this.groundOffset;
+    if (this.mesh.position.y <= groundY) {
+      this.mesh.position.y = groundY;
+      this.velocityY = 0;
+      this.onGround = true;
+    }
+
+    // 맵 경계: 활동 반경 밖으로 나가지 못하게 클램프
+    const br = Math.hypot(this.mesh.position.x, this.mesh.position.z);
+    if (br > this.bound) {
+      const kb = this.bound / br;
+      this.mesh.position.x *= kb;
+      this.mesh.position.z *= kb;
+    }
+
+    // 나무·바위·연못 충돌: 장애물 밖으로 밀어냄
+    resolveCollision(this.mesh.position, this.radius);
+
+    // 애니메이션 상태 선택 (클립이 있을 때만)
+    if (this.mixer) {
+      let kind = 'idle';
+      if (!this.onGround && this.actions.jump) kind = 'jump';
+      else if (moving) kind = running && this.actions.run ? 'run' : 'walk';
+      this._setAction(kind);
+      this.mixer.update(dt);
+    }
+
+    this._updateCamera(camera);
+  }
+
+  // V: 1·3인칭 전환. 1인칭에선 캐릭터 모델을 숨겨 머리 안이 보이지 않게.
+  toggleView() {
+    this.setFirstPerson(!this.firstPerson);
+  }
+
+  setFirstPerson(v) {
+    this.firstPerson = v;
+    if (this.model) this.model.visible = !v;
+  }
+
+  // 운석에 휩쓸림 — 조작 정지 (main이 엔딩 처리)
+  kill() { this.dead = true; }
+
+  _updateCamera(camera) {
+    if (this.firstPerson) return this._updateCameraFP(camera);
+
+    const dist = this.cameraDistance;
+    const height = dist * 0.35;
+    const offset = new THREE.Vector3(
+      Math.sin(this.yaw) * dist * Math.cos(this.cameraPitch),
+      height + Math.sin(this.cameraPitch) * dist,
+      Math.cos(this.yaw) * dist * Math.cos(this.cameraPitch)
+    );
+    const target = this.mesh.position.clone().add(offset);
+    camera.position.lerp(target, 0.15);
+    camera.lookAt(
+      this.mesh.position.x,
+      this.mesh.position.y + 1.5,
+      this.mesh.position.z
+    );
+  }
+
+  // 1인칭: 눈높이에서 yaw/pitch 방향을 바라봄 (위치는 즉시 추적, 흔들림 없음)
+  _updateCameraFP(camera) {
+    const eye = this.mesh.position.clone();
+    eye.y += this.eyeHeight;
+    camera.position.copy(eye);
+    // cameraPitch 0.3 = 정면. 마우스 아래로 → 아래를 봄.
+    const lp = this.cameraPitch - 0.3;
+    const cp = Math.cos(lp);
+    const dir = new THREE.Vector3(
+      -Math.sin(this.yaw) * cp,
+      -Math.sin(lp),
+      -Math.cos(this.yaw) * cp
+    );
+    camera.lookAt(eye.add(dir));
+  }
+}
+
+// 클립 이름 → 동작 키워드 (Mixamo/Quaternius 공통)
+function classifyClip(clipName) {
+  const n = (clipName || '').toLowerCase();
+  if (n.includes('idle')) return 'idle';
+  if (n.includes('walk')) return 'walk';
+  if (n.includes('run') || n.includes('jog')) return 'run';
+  if (n.includes('jump')) return 'jump';
+  return null;
+}
+
+// Mixamo 루트 모션 제거: 엉덩이(Hips) 위치 트랙을 첫 프레임 값으로 고정해
+// 완전한 제자리 애니메이션으로 만든다(이동은 코드가 담당).
+// glTF 변환 시 전진 모션이 Y축으로 들어가기도 하므로 X·Y·Z 모두 고정해야
+// 클립 반복마다 위치가 리셋되며 순간이동하던 현상이 사라진다.
+function stripRootMotion(clip) {
+  for (const track of clip.tracks) {
+    if (/hips?\.position$/i.test(track.name)) {
+      const v = track.values; // [x,y,z, x,y,z, ...]
+      const x0 = v[0], y0 = v[1], z0 = v[2];
+      for (let i = 0; i < v.length; i += 3) {
+        v[i] = x0; v[i + 1] = y0; v[i + 2] = z0;
+      }
+    }
+  }
+}

@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>사라지기 전에 (Before It's Gone)</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Nanum+Myeongjo:wght@400;700;800&display=swap" rel="stylesheet" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #87b9d4; font-family: sans-serif; }
+    #app { width: 100vw; height: 100vh; display: block; }
+    #hud {
+      position: fixed; top: 12px; left: 12px; color: #fff;
+      text-shadow: 0 1px 3px rgba(0,0,0,.6); font-size: 14px; line-height: 1.5;
+      pointer-events: none; user-select: none;
+    }
+    #hud kbd {
+      background: rgba(0,0,0,.45); border-radius: 4px; padding: 1px 6px; font-family: monospace;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="app"></canvas>
+  <div id="hud">
+    <strong>사라지기 전에</strong> — 충돌까지 다섯 시간, 사라질 생명을 카메라에 담으세요<br />
+    <kbd>W A S D</kbd> 이동 · <kbd>Shift</kbd> 달리기 · <kbd>Space</kbd> 점프 · <kbd>V</kbd> 시점<br />
+    <kbd>Mouse</kbd> 둘러보기(클릭하여 잠금) · <kbd>C</kbd> 카메라 · <kbd>좌클릭</kbd> 촬영<br />
+    <kbd>Tab</kbd> 도감 · <kbd>Esc</kbd> 일시정지
+  </div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

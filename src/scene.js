@@ -1,0 +1,49 @@
+import * as THREE from 'three';
+
+// 씬, 카메라, 렌더러, 조명, 그림자, 안개 구성
+export function createScene(canvas) {
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x87b9d4);
+  // 거리 안개 — 시야 제한 + 분위기 + 원경 드로우 절감.
+  // near/far는 Doomsday가 종말 진행에 따라 보간(가까울수록 자욱).
+  scene.fog = new THREE.Fog(0x87b9d4, 18, 75);
+
+  const camera = new THREE.PerspectiveCamera(
+    60, window.innerWidth / window.innerHeight, 0.1, 500
+  );
+  camera.position.set(0, 6, 10);
+
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true, powerPreference: 'high-performance' });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5)); // 성능: 하이DPI 과다 렌더 방지(선명도 약간↓, 되돌리려면 2)
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFShadowMap;
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+  // 환경광 + 태양(그림자 생성용 DirectionalLight)
+  const hemi = new THREE.HemisphereLight(0xbfd8ff, 0x4f6b3a, 0.7);
+  scene.add(hemi);
+
+  const sun = new THREE.DirectionalLight(0xfff2cc, 2.2);
+  sun.position.set(30, 50, 20);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(1024, 1024);  // 2048→1024: 그림자 패스 fill 비용 절감(저폴리라 체감 차이 적음)
+  sun.shadow.camera.near = 1;
+  sun.shadow.camera.far = 150;
+  const d = 60;
+  sun.shadow.camera.left = -d;
+  sun.shadow.camera.right = d;
+  sun.shadow.camera.top = d;
+  sun.shadow.camera.bottom = -d;
+  sun.shadow.bias = -0.0005;
+  scene.add(sun);
+  scene.add(sun.target);
+
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  return { scene, camera, renderer, sun, hemi };
+}
